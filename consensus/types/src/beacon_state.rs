@@ -15,6 +15,7 @@ use safe_arith::{ArithError, SafeArith};
 use serde::{Deserialize, Deserializer, Serialize};
 use ssz::{ssz_encode, Decode, DecodeError, Encode};
 use ssz_derive::{Decode, Encode};
+use core::f64;
 use std::hash::Hash;
 use std::{fmt, mem, sync::Arc};
 use superstruct::superstruct;
@@ -948,9 +949,11 @@ impl<E: EthSpec> BeaconState<E> {
                 .get(shuffled_index)
                 .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
             let random_value = self.shuffling_random_value(i, seed)?;
-            let effective_balance = self.get_effective_balance(candidate_index)?;
-            if effective_balance.safe_mul(max_random_value)?
-                >= max_effective_balance.safe_mul(random_value)?
+            let gini = self.compute_gini_coefficient(indices)?;
+            let stake_power = self.compute_stake_power(candidate_index, indices, gini)?;
+            let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
+            if stake_power.safe_mul(max_random_value)?
+                >= max_stake_power.safe_mul(random_value)?
             {
                 return Ok(candidate_index);
             }
@@ -975,6 +978,80 @@ impl<E: EthSpec> BeaconState<E> {
                 self.compute_proposer_index(indices, &seed, spec)
             })
             .collect()
+    }
+
+    fn compute_stake_power(&self, effective_balance: u64, indices: &[usize], gini: f64) -> Result<f64, Error> {
+        let pmin: f64 = 0.5;
+        let pmax: f64 = 0.8;
+        let one: f64 = 1.0;
+        let power: f64 = pmin.min(pmax.max(one - gini));
+        
+        let mut eb = (effective_balance as f64).powf(power);
+
+        let mut balances: Vec<u64> = Vec::new();
+        for &i in indices {
+            balances.push(self.get_effective_balance(i)?);
+        }
+
+        let total_weight = balances.iter().sum::<u64>() as f64;
+        if total_weight == 0.0 {
+            return Ok(0.0);
+        }
+
+        eb = eb / total_weight.powf(power);
+        Ok(eb)
+    }
+
+    /// Computes the Gini coefficient for the given validator indices based on their effective balances.
+    /// The Gini coefficient measures inequality in the distribution of effective balances.
+    /// Returns a value between 0 (perfect equality) and 1 (maximum inequality).
+    fn compute_gini_coefficient(&self, indices: &[usize]) -> Result<f64, Error> {
+        if indices.is_empty() {
+            return Ok(0.0);
+        }
+
+        // Collect effective balances for the given indices
+        let mut balances: Vec<u64> = Vec::new();
+        for &i in indices {
+            balances.push(self.get_effective_balance(i)?);
+        }
+
+        // Sort balances in ascending order for Lorenz curve calculation
+        balances.sort_unstable();
+
+        let total_weight = balances.iter().sum::<u64>() as f64;
+        if total_weight == 0.0 {
+            return Ok(0.0);
+        }
+
+        // Calculate cumulative weights for Lorenz curve
+        let mut cum_weights = Vec::with_capacity(balances.len());
+        let mut cumulative = 0.0;
+        for balance in &balances {
+            cumulative += *balance as f64;
+            cum_weights.push(cumulative / total_weight);
+        }
+
+        // Calculate area under Lorenz curve using trapezoidal rule
+        let dx = 1.0 / balances.len() as f64;
+        let area_under_lorenz = Self::trapz(&cum_weights, dx);
+
+        // Gini coefficient = 1 - 2 * area_under_lorenz_curve
+        let gini_coefficient = 1.0 - 2.0 * area_under_lorenz;
+        Ok(gini_coefficient)
+    }
+
+    /// Computes the area under a curve using the trapezoidal rule.
+    fn trapz(y: &[f64], dx: f64) -> f64 {
+        if y.len() < 2 {
+            return 0.0;
+        }   
+        
+        let mut area = 0.0;
+        for i in 0..y.len() - 1 {
+            area += 0.5 * (y[i] + y[i + 1]) * dx;
+        }
+        area
     }
 
     /// Fork-aware abstraction for the shuffling.
