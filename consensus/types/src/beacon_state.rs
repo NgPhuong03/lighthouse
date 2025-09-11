@@ -950,10 +950,14 @@ impl<E: EthSpec> BeaconState<E> {
                 .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
             let random_value = self.shuffling_random_value(i, seed)?;
             let gini = self.compute_gini_coefficient(indices)?;
-            let stake_power = self.compute_stake_power(candidate_index, indices, gini)?;
+
+            let effective_balance = self.get_effective_balance(candidate_index)?;
+
+            let stake_power = self.compute_stake_power(effective_balance, indices, gini)?;
             let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
-            if stake_power.safe_mul(max_random_value)?
-                >= max_stake_power.safe_mul(random_value)?
+            
+            if stake_power * (max_random_value as f64)
+                >= max_stake_power * (random_value as f64)
             {
                 return Ok(candidate_index);
             }
