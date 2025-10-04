@@ -929,6 +929,9 @@ impl<E: EthSpec> BeaconState<E> {
             return Err(Error::InsufficientValidators);
         }
 
+        // Compute Gini once per call to avoid repeated recalculations within the loop.
+        let gini = self.compute_gini_coefficient(indices)?;
+
         let max_effective_balance = spec.max_effective_balance_for_fork(self.fork_name_unchecked());
         let max_random_value = if self.fork_name_unchecked().electra_enabled() {
             MAX_RANDOM_VALUE
@@ -949,7 +952,6 @@ impl<E: EthSpec> BeaconState<E> {
                 .get(shuffled_index)
                 .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
             let random_value = self.shuffling_random_value(i, seed)?;
-            let gini = self.compute_gini_coefficient(indices)?;
 
             let effective_balance = self.get_effective_balance(candidate_index)?;
 
@@ -973,15 +975,67 @@ impl<E: EthSpec> BeaconState<E> {
         indices: &[usize],
         spec: &ChainSpec,
     ) -> Result<Vec<usize>, Error> {
+        // Pre-compute Gini once for all slots in this epoch to avoid repeated work.
+        let gini = self.compute_gini_coefficient(indices)?;
+
         epoch
             .slot_iter(E::slots_per_epoch())
             .map(|slot| {
                 let mut preimage = seed.to_vec();
                 preimage.append(&mut int_to_bytes8(slot.as_u64()));
                 let seed = hash(&preimage);
-                self.compute_proposer_index(indices, &seed, spec)
+                self.compute_proposer_index_with_gini(indices, &seed, spec, gini)
             })
             .collect()
+    }
+
+    /// Computes the proposer index using a pre-computed Gini coefficient to avoid redundant
+    /// Gini calculations. `gini` should be the Gini coefficient for the provided `indices`.
+    /// Returns the selected proposer index.
+    fn compute_proposer_index_with_gini(
+        &self,
+        indices: &[usize],
+        seed: &[u8],
+        spec: &ChainSpec,
+        gini: f64,
+    ) -> Result<usize, Error> {
+        if indices.is_empty() {
+            return Err(Error::InsufficientValidators);
+        }
+
+        let max_effective_balance = spec.max_effective_balance_for_fork(self.fork_name_unchecked());
+        let max_random_value = if self.fork_name_unchecked().electra_enabled() {
+            MAX_RANDOM_VALUE
+        } else {
+            MAX_RANDOM_BYTE
+        };
+
+        let mut i = 0;
+        loop {
+            let shuffled_index = compute_shuffled_index(
+                i.safe_rem(indices.len())?,
+                indices.len(),
+                seed,
+                spec.shuffle_round_count,
+            )
+            .ok_or(Error::UnableToShuffle)?;
+            let candidate_index = *indices
+                .get(shuffled_index)
+                .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
+            let random_value = self.shuffling_random_value(i, seed)?;
+
+            let effective_balance = self.get_effective_balance(candidate_index)?;
+
+            let stake_power = self.compute_stake_power(effective_balance, indices, gini)?;
+            let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
+
+            if stake_power * (max_random_value as f64)
+                >= max_stake_power * (random_value as f64)
+            {
+                return Ok(candidate_index);
+            }
+            i.safe_add_assign(1)?;
+        }
     }
 
     fn compute_stake_power(&self, effective_balance: u64, indices: &[usize], gini: f64) -> Result<f64, Error> {
@@ -997,12 +1051,16 @@ impl<E: EthSpec> BeaconState<E> {
             balances.push(self.get_effective_balance(i)?);
         }
 
-        let total_weight = balances.iter().sum::<u64>() as f64;
-        if total_weight == 0.0 {
+        // Accumulate using u128 for higher integer precision, then convert for floating ops.
+        let total_weight_u128: u128 = balances
+            .iter()
+            .fold(0u128, |acc, b| acc.saturating_add(*b as u128));
+        if total_weight_u128 == 0 {
             return Ok(0.0);
         }
 
-        eb = eb / total_weight.powf(power);
+        let total_weight_f64 = total_weight_u128 as f64;
+        eb = eb / total_weight_f64.powf(power);
         Ok(eb)
     }
 
@@ -1023,17 +1081,21 @@ impl<E: EthSpec> BeaconState<E> {
         // Sort balances in ascending order for Lorenz curve calculation
         balances.sort_unstable();
 
-        let total_weight = balances.iter().sum::<u64>() as f64;
-        if total_weight == 0.0 {
+        // Sum with u128 to reduce overflow/precision issues prior to conversion.
+        let total_weight_u128: u128 = balances
+            .iter()
+            .fold(0u128, |acc, b| acc.saturating_add(*b as u128));
+        if total_weight_u128 == 0 {
             return Ok(0.0);
         }
+        let total_weight_f64 = total_weight_u128 as f64;
 
         // Calculate cumulative weights for Lorenz curve
         let mut cum_weights = Vec::with_capacity(balances.len());
-        let mut cumulative = 0.0;
+        let mut cumulative_u128: u128 = 0;
         for balance in &balances {
-            cumulative += *balance as f64;
-            cum_weights.push(cumulative / total_weight);
+            cumulative_u128 = cumulative_u128.saturating_add(*balance as u128);
+            cum_weights.push((cumulative_u128 as f64) / total_weight_f64);
         }
 
         // Calculate area under Lorenz curve using trapezoidal rule
