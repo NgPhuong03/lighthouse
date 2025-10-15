@@ -951,13 +951,13 @@ impl<E: EthSpec> BeaconState<E> {
             let random_value = self.shuffling_random_value(i, seed)?;
             let effective_balance = self.get_effective_balance(candidate_index)?;
 
-            // Apply sqrt-weighting to balance deterministically (integer sqrt), then
-            // compare against a scaled random threshold, preserving original selection shape.
-            let candidate_power = Self::compute_stake_power(effective_balance) as u128;
-            let max_power = Self::compute_stake_power(max_effective_balance) as u128;
+            // Apply natural-log weighting to balance deterministically (base-e), then
+            // compare against a scaled random threshold, preserving monotonic selection.
+            let candidate_power = Self::compute_stake_power(effective_balance, max_random_value) as f64;
+            let max_power = Self::compute_stake_power(max_effective_balance, random_value) as f64;
 
-            if candidate_power.saturating_mul(max_random_value as u128)
-                >= max_power.saturating_mul(random_value as u128)
+            if candidate_power
+                >= max_power
             {
                 return Ok(candidate_index);
             }
@@ -965,35 +965,19 @@ impl<E: EthSpec> BeaconState<E> {
         }
     }
 
-    /// Integer sqrt-based weighting for proposer selection.
+    /// Compute a weighted proposer power using natural logarithm of the stake.
     ///
-    /// - purpose: reduce the impact of large `effective_balance` by using floor(sqrt(balance)).
-    /// - params: `value` is the validator's `effective_balance` (in gwei).
-    /// - returns: floor(sqrt(value)) as `u64`.
-    /// - usage: used in proposer selection comparisons; avoids floating-point for consensus safety.
-    fn compute_stake_power(value: u64) -> u64 {
-        Self::integer_sqrt_u64(value)
+    /// - balance: validator effective balance (gwei units).
+    /// - random_value: the shuffling random value used for scaling.
+    /// - returns: `ln(balance) * random_value` as f64; returns 0.0 when balance is 0.
+    fn compute_stake_power(balance: u64, random_value: u64) -> f64 {
+        if balance == 0 {
+            return 0.0;
+        }
+        let log_balance = (balance as f64).ln();
+        log_balance * (random_value as f64)
     }
 
-    /// Compute floor(sqrt(x)) using integer Newton's method.
-    ///
-    /// - purpose: deterministic sqrt without floating point.
-    /// - params: `x` is a non-negative `u64`.
-    /// - returns: floor(sqrt(x)).
-    fn integer_sqrt_u64(x: u64) -> u64 {
-        if x < 2 {
-            return x;
-        }
-        // Initial approximation: 2^(ceil(log2(x))/2)
-        let mut y = 1u64 << ((64u32 - x.leading_zeros() + 1) / 2);
-        loop {
-            let next = (y + x / y) >> 1;
-            if next >= y {
-                return y;
-            }
-            y = next;
-        }
-    }
 
     // Vec is just much easier to work with here
     fn compute_proposer_indices(
