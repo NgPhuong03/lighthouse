@@ -958,9 +958,12 @@ impl<E: EthSpec> BeaconState<E> {
             let stake_power = self.compute_stake_power(effective_balance, indices, gini)?;
             let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
             
-            if stake_power * (max_random_value as f64)
-                >= max_stake_power * (random_value as f64)
-            {
+            // Apply epsilon tolerance to ignore tiny differences in floating-point comparison
+            const EPSILON: f64 = 1e-12;
+            let lhs = stake_power * (max_random_value as f64);
+            let rhs = max_stake_power * (random_value as f64);
+            let threshold = rhs - EPSILON * rhs.abs().max(1.0);
+            if lhs >= threshold {
                 return Ok(candidate_index);
             }
             i.safe_add_assign(1)?;
@@ -1029,9 +1032,12 @@ impl<E: EthSpec> BeaconState<E> {
             let stake_power = self.compute_stake_power(effective_balance, indices, gini)?;
             let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
 
-            if stake_power * (max_random_value as f64)
-                >= max_stake_power * (random_value as f64)
-            {
+            // Apply epsilon tolerance to ignore tiny differences in floating-point comparison
+            const EPSILON: f64 = 1e-12;
+            let lhs = stake_power * (max_random_value as f64);
+            let rhs = max_stake_power * (random_value as f64);
+            let threshold = rhs - EPSILON * rhs.abs().max(1.0);
+            if lhs >= threshold {
                 return Ok(candidate_index);
             }
             i.safe_add_assign(1)?;
