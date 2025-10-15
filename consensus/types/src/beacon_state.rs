@@ -953,12 +953,15 @@ impl<E: EthSpec> BeaconState<E> {
 
             // Apply sqrt-weighting to balance deterministically (integer sqrt), then
             // compare against a scaled random threshold, preserving original selection shape.
-            let candidate_power = Self::compute_stake_power(effective_balance) as u128;
-            let max_power = Self::compute_stake_power(max_effective_balance) as u128;
+            let candidate_power = Self::compute_stake_power(effective_balance, max_random_value) as f64;
+            let max_power = Self::compute_stake_power(max_effective_balance, random_value) as f64;
 
-            if candidate_power.saturating_mul(max_random_value as u128)
-                >= max_power.saturating_mul(random_value as u128)
-            {
+            let rel_tol: f64 = 1e-12;
+            let abs_tol: f64 = 1e-14;
+            
+            let tolerance = (max_power.abs() * rel_tol).max(abs_tol);
+            
+            if candidate_power >= max_power - tolerance {
                 return Ok(candidate_index);
             }
             i.safe_add_assign(1)?;
@@ -971,29 +974,12 @@ impl<E: EthSpec> BeaconState<E> {
     /// - params: `value` is the validator's `effective_balance` (in gwei).
     /// - returns: floor(sqrt(value)) as `u64`.
     /// - usage: used in proposer selection comparisons; avoids floating-point for consensus safety.
-    fn compute_stake_power(value: u64) -> u64 {
-        Self::integer_sqrt_u64(value)
+    fn compute_stake_power(value: u64, random_value: u64) -> f64 {
+        let sq_balance = (value as f64).sqrt();
+        sq_balance * (random_value as f64)
     }
 
-    /// Compute floor(sqrt(x)) using integer Newton's method.
-    ///
-    /// - purpose: deterministic sqrt without floating point.
-    /// - params: `x` is a non-negative `u64`.
-    /// - returns: floor(sqrt(x)).
-    fn integer_sqrt_u64(x: u64) -> u64 {
-        if x < 2 {
-            return x;
-        }
-        // Initial approximation: 2^(ceil(log2(x))/2)
-        let mut y = 1u64 << ((64u32 - x.leading_zeros() + 1) / 2);
-        loop {
-            let next = (y + x / y) >> 1;
-            if next >= y {
-                return y;
-            }
-            y = next;
-        }
-    }
+
 
     // Vec is just much easier to work with here
     fn compute_proposer_indices(
