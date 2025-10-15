@@ -929,9 +929,6 @@ impl<E: EthSpec> BeaconState<E> {
             return Err(Error::InsufficientValidators);
         }
 
-        // Compute Gini once per call to avoid repeated recalculations within the loop.
-        let gini = self.compute_gini_coefficient(indices)?;
-
         let max_effective_balance = spec.max_effective_balance_for_fork(self.fork_name_unchecked());
         let max_random_value = if self.fork_name_unchecked().electra_enabled() {
             MAX_RANDOM_VALUE
@@ -952,18 +949,49 @@ impl<E: EthSpec> BeaconState<E> {
                 .get(shuffled_index)
                 .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
             let random_value = self.shuffling_random_value(i, seed)?;
-
             let effective_balance = self.get_effective_balance(candidate_index)?;
 
-            let stake_power = self.compute_stake_power(effective_balance, indices, gini)?;
-            let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
-            
-            if stake_power * (max_random_value as f64)
-                >= max_stake_power * (random_value as f64)
+            // Apply sqrt-weighting to balance deterministically (integer sqrt), then
+            // compare against a scaled random threshold, preserving original selection shape.
+            let candidate_power = Self::compute_stake_power(effective_balance) as u128;
+            let max_power = Self::compute_stake_power(max_effective_balance) as u128;
+
+            if candidate_power.saturating_mul(max_random_value as u128)
+                >= max_power.saturating_mul(random_value as u128)
             {
                 return Ok(candidate_index);
             }
             i.safe_add_assign(1)?;
+        }
+    }
+
+    /// Integer sqrt-based weighting for proposer selection.
+    ///
+    /// - purpose: reduce the impact of large `effective_balance` by using floor(sqrt(balance)).
+    /// - params: `value` is the validator's `effective_balance` (in gwei).
+    /// - returns: floor(sqrt(value)) as `u64`.
+    /// - usage: used in proposer selection comparisons; avoids floating-point for consensus safety.
+    fn compute_stake_power(value: u64) -> u64 {
+        Self::integer_sqrt_u64(value)
+    }
+
+    /// Compute floor(sqrt(x)) using integer Newton's method.
+    ///
+    /// - purpose: deterministic sqrt without floating point.
+    /// - params: `x` is a non-negative `u64`.
+    /// - returns: floor(sqrt(x)).
+    fn integer_sqrt_u64(x: u64) -> u64 {
+        if x < 2 {
+            return x;
+        }
+        // Initial approximation: 2^(ceil(log2(x))/2)
+        let mut y = 1u64 << ((64u32 - x.leading_zeros() + 1) / 2);
+        loop {
+            let next = (y + x / y) >> 1;
+            if next >= y {
+                return y;
+            }
+            y = next;
         }
     }
 
@@ -975,8 +1003,6 @@ impl<E: EthSpec> BeaconState<E> {
         indices: &[usize],
         spec: &ChainSpec,
     ) -> Result<Vec<usize>, Error> {
-        // Pre-compute Gini once for all slots in this epoch to avoid repeated work.
-        let gini = self.compute_gini_coefficient(indices)?;
 
         epoch
             .slot_iter(E::slots_per_epoch())
@@ -984,140 +1010,9 @@ impl<E: EthSpec> BeaconState<E> {
                 let mut preimage = seed.to_vec();
                 preimage.append(&mut int_to_bytes8(slot.as_u64()));
                 let seed = hash(&preimage);
-                self.compute_proposer_index_with_gini(indices, &seed, spec, gini)
+                self.compute_proposer_index(indices, &seed, spec)
             })
             .collect()
-    }
-
-    /// Computes the proposer index using a pre-computed Gini coefficient to avoid redundant
-    /// Gini calculations. `gini` should be the Gini coefficient for the provided `indices`.
-    /// Returns the selected proposer index.
-    fn compute_proposer_index_with_gini(
-        &self,
-        indices: &[usize],
-        seed: &[u8],
-        spec: &ChainSpec,
-        gini: f64,
-    ) -> Result<usize, Error> {
-        if indices.is_empty() {
-            return Err(Error::InsufficientValidators);
-        }
-
-        let max_effective_balance = spec.max_effective_balance_for_fork(self.fork_name_unchecked());
-        let max_random_value = if self.fork_name_unchecked().electra_enabled() {
-            MAX_RANDOM_VALUE
-        } else {
-            MAX_RANDOM_BYTE
-        };
-
-        let mut i = 0;
-        loop {
-            let shuffled_index = compute_shuffled_index(
-                i.safe_rem(indices.len())?,
-                indices.len(),
-                seed,
-                spec.shuffle_round_count,
-            )
-            .ok_or(Error::UnableToShuffle)?;
-            let candidate_index = *indices
-                .get(shuffled_index)
-                .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
-            let random_value = self.shuffling_random_value(i, seed)?;
-
-            let effective_balance = self.get_effective_balance(candidate_index)?;
-
-            let stake_power = self.compute_stake_power(effective_balance, indices, gini)?;
-            let max_stake_power = self.compute_stake_power(max_effective_balance, indices, gini)?;
-
-            if stake_power * (max_random_value as f64)
-                >= max_stake_power * (random_value as f64)
-            {
-                return Ok(candidate_index);
-            }
-            i.safe_add_assign(1)?;
-        }
-    }
-
-    fn compute_stake_power(&self, effective_balance: u64, indices: &[usize], gini: f64) -> Result<f64, Error> {
-        let pmin: f64 = 0.5;
-        let pmax: f64 = 0.8;
-        let one: f64 = 1.0;
-        let power: f64 = pmin.min(pmax.max(one - gini));
-        
-        let mut eb = (effective_balance as f64).powf(power);
-
-        let mut balances: Vec<u64> = Vec::new();
-        for &i in indices {
-            balances.push(self.get_effective_balance(i)?);
-        }
-
-        // Accumulate using u128 for higher integer precision, then convert for floating ops.
-        let total_weight_u128: u128 = balances
-            .iter()
-            .fold(0u128, |acc, b| acc.saturating_add(*b as u128));
-        if total_weight_u128 == 0 {
-            return Ok(0.0);
-        }
-
-        let total_weight_f64 = total_weight_u128 as f64;
-        eb = eb / total_weight_f64.powf(power);
-        Ok(eb)
-    }
-
-    /// Computes the Gini coefficient for the given validator indices based on their effective balances.
-    /// The Gini coefficient measures inequality in the distribution of effective balances.
-    /// Returns a value between 0 (perfect equality) and 1 (maximum inequality).
-    fn compute_gini_coefficient(&self, indices: &[usize]) -> Result<f64, Error> {
-        if indices.is_empty() {
-            return Ok(0.0);
-        }
-
-        // Collect effective balances for the given indices
-        let mut balances: Vec<u64> = Vec::new();
-        for &i in indices {
-            balances.push(self.get_effective_balance(i)?);
-        }
-
-        // Sort balances in ascending order for Lorenz curve calculation
-        balances.sort_unstable();
-
-        // Sum with u128 to reduce overflow/precision issues prior to conversion.
-        let total_weight_u128: u128 = balances
-            .iter()
-            .fold(0u128, |acc, b| acc.saturating_add(*b as u128));
-        if total_weight_u128 == 0 {
-            return Ok(0.0);
-        }
-        let total_weight_f64 = total_weight_u128 as f64;
-
-        // Calculate cumulative weights for Lorenz curve
-        let mut cum_weights = Vec::with_capacity(balances.len());
-        let mut cumulative_u128: u128 = 0;
-        for balance in &balances {
-            cumulative_u128 = cumulative_u128.saturating_add(*balance as u128);
-            cum_weights.push((cumulative_u128 as f64) / total_weight_f64);
-        }
-
-        // Calculate area under Lorenz curve using trapezoidal rule
-        let dx = 1.0 / balances.len() as f64;
-        let area_under_lorenz = Self::trapz(&cum_weights, dx);
-
-        // Gini coefficient = 1 - 2 * area_under_lorenz_curve
-        let gini_coefficient = 1.0 - 2.0 * area_under_lorenz;
-        Ok(gini_coefficient)
-    }
-
-    /// Computes the area under a curve using the trapezoidal rule.
-    fn trapz(y: &[f64], dx: f64) -> f64 {
-        if y.len() < 2 {
-            return 0.0;
-        }   
-        
-        let mut area = 0.0;
-        for i in 0..y.len() - 1 {
-            area += 0.5 * (y[i] + y[i + 1]) * dx;
-        }
-        area
     }
 
     /// Fork-aware abstraction for the shuffling.
