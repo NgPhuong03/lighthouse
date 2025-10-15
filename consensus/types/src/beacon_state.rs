@@ -956,9 +956,13 @@ impl<E: EthSpec> BeaconState<E> {
             let candidate_power = Self::compute_stake_power(effective_balance, max_random_value) as f64;
             let max_power = Self::compute_stake_power(max_effective_balance, random_value) as f64;
 
-            if candidate_power
-                >= max_power
-            {
+            const REL_TOL: f64 = 1e-12;
+            const ABS_TOL: f64 = 1e-14;
+            
+            let tol = (candidate_power.abs().max(max_power.abs()) * REL_TOL).max(ABS_TOL);
+            
+            // “candidate_power >= max_power” với vùng dung sai:
+            if candidate_power >= max_power - tol {
                 return Ok(candidate_index);
             }
             i.safe_add_assign(1)?;
