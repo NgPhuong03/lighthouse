@@ -956,8 +956,8 @@ impl<E: EthSpec> BeaconState<E> {
             let candidate_power = Self::compute_stake_power(effective_balance, max_random_value) as f64;
             let max_power = Self::compute_stake_power(max_effective_balance, random_value) as f64;
 
-            let rel_tol: f64 = 1e-12;
-            let abs_tol: f64 = 1e-14;
+            let rel_tol: f64 = 1e-9;
+            let abs_tol: f64 = 1e-12;
             
             let tolerance = (max_power.abs() * rel_tol).max(abs_tol);
             
