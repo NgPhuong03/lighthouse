@@ -951,16 +951,17 @@ impl<E: EthSpec> BeaconState<E> {
             let random_value = self.shuffling_random_value(i, seed)?;
             let effective_balance = self.get_effective_balance(candidate_index)?;
 
-            // Apply sqrt-weighting to balance deterministically (integer sqrt), then
-            // compare against a scaled random threshold, preserving original selection shape.
-            let candidate_power = Self::compute_stake_power(effective_balance, max_random_value) as f64;
-            let max_power = Self::compute_stake_power(max_effective_balance, random_value) as f64;
+            // Apply natural-log weighting to balance deterministically (base-e), then
+            // compare against a scaled random threshold, preserving monotonic selection.
+            let candidate_power = Self::compute_stake_power(effective_balance, max_random_value);
+            let max_power = Self::compute_stake_power(max_effective_balance, random_value);
 
-            let rel_tol: f64 = 1e-9;
-            let abs_tol: f64 = 1e-12;
+            let rel_tol = 1e-7;
+            let abs_tol = 1e-3;
             
             let tolerance = (max_power.abs() * rel_tol).max(abs_tol);
             
+            // "candidate_power >= max_power" với vùng dung sai:
             if candidate_power >= max_power - tolerance {
                 return Ok(candidate_index);
             }
@@ -968,15 +969,17 @@ impl<E: EthSpec> BeaconState<E> {
         }
     }
 
-    /// Integer sqrt-based weighting for proposer selection.
+    /// Compute a weighted proposer power using natural logarithm of the stake.
     ///
-    /// - purpose: reduce the impact of large `effective_balance` by using floor(sqrt(balance)).
-    /// - params: `value` is the validator's `effective_balance` (in gwei).
-    /// - returns: floor(sqrt(value)) as `u64`.
-    /// - usage: used in proposer selection comparisons; avoids floating-point for consensus safety.
-    fn compute_stake_power(value: u64, random_value: u64) -> f64 {
-        let sq_balance = (value as f64).sqrt();
-        sq_balance * (random_value as f64)
+    /// - balance: validator effective balance (gwei units).
+    /// - random_value: the shuffling random value used for scaling.
+    /// - returns: `ln(balance) * random_value` as f64; returns 0.0 when balance is 0.
+    fn compute_stake_power(balance: u64, random_value: u64) -> f64 {
+        if balance == 0 {
+            return 0.0;
+        }
+        let log_balance = (balance as f64).sqrt();
+        log_balance * (random_value as f64)
     }
 
 
