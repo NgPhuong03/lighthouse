@@ -953,16 +953,16 @@ impl<E: EthSpec> BeaconState<E> {
 
             // Apply natural-log weighting to balance deterministically (base-e), then
             // compare against a scaled random threshold, preserving monotonic selection.
-            let candidate_power = Self::compute_stake_power(effective_balance, max_random_value) as f64;
-            let max_power = Self::compute_stake_power(max_effective_balance, random_value) as f64;
+            let candidate_power = Self::compute_stake_power(effective_balance, max_random_value);
+            let max_power = Self::compute_stake_power(max_effective_balance, random_value);
 
-            const REL_TOL: f64 = 1e-9;
-            const ABS_TOL: f64 = 1e-12;
+            let rel_tol = 1e-7;
+            let abs_tol = 1e-3;
             
-            let tol = (candidate_power.abs().max(max_power.abs()) * REL_TOL).max(ABS_TOL);
+            let tolerance = (max_power.abs() * rel_tol).max(abs_tol);
             
-            // “candidate_power >= max_power” với vùng dung sai:
-            if candidate_power >= max_power - tol {
+            // "candidate_power >= max_power" với vùng dung sai:
+            if candidate_power >= max_power - tolerance {
                 return Ok(candidate_index);
             }
             i.safe_add_assign(1)?;
